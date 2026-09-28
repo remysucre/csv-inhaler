@@ -38,19 +38,17 @@ parse, an [Ollaya](https://ollaya.dev) decision model is asked one yes/no questi
 
 ## Benchmark
 
-The same questions make a benchmark for decision models, and there every decision is independent: the
-ground truth supplies the parse so far, so a record's questions go out in one batched request and records
-run in parallel. Nothing is decoded.
+The same questions make a benchmark for decision models. `bench/data/decisions.jsonl` holds 860 records from
+clean public data (Project Gutenberg catalog, NYC job postings, Hacker News comments) written the way a
+generator that never quotes would write them: cells joined by commas, no quoting, no escaping. Every comma and
+line break is a labelled decision, 32,571 in all. Every decision is asked with ground-truth context, so a
+record's questions go in one batched request and records run in parallel.
 
 ```sh
-python3 bench/build.py --per-source 300         # downloads clean data, writes bench/data/decisions.jsonl
-python3 bench/run.py --model winnow:e4b --limit 100 --workers 4 --out bench/data/winnow.jsonl
+python3 bench/run.py --host https://api.typesafe.ai --model jev-latest --limit 100 --workers 6 \
+    --examples 0 --profiles 20 --label "Attempting to parse" --out bench/data/jev2_noul.jsonl
 ```
 
-`build.py` takes clean public data with cells that naturally contain commas, quotes and line breaks
-(Project Gutenberg catalog, NYC job postings, Hacker News comments), removes the quoting from one such
-cell per record ("unquoted"), or keeps the quotes but stops doubling the inner ones ("unescaped"), and
-labels every delimiter, quote and line break in the result as syntax or text. `run.py` asks the model each
-question with the shared wording from `csv_inhaler.question`, optionally with the teacher-forced parse so
-far (`--so-far`), and reports accuracy per source, decision type and truth class, plus the share of records
-with every decision right. Records that exceed the model's context are counted separately.
+Jev reaches 98% of decisions with that configuration (about $0.08 and 15 s per run); see `HANDOFF.md` for
+the results table, what was tried, and what failed. `bench/build.py` rebuilds the dataset from the live
+sources, which drift, so the committed file is the benchmark.

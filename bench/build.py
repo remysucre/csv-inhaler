@@ -12,6 +12,12 @@ line break inside a value is bare. Every comma and line break in the result is a
 (separator / end of record) or text. Quotes are never a decision.
 
     python3 bench/build.py --per-source 300   ->  bench/data/decisions.jsonl
+
+The file starts with one {"meta": ...} line per source (column names and a pool of up to 400 clean rows from
+outside the benchmark), then one line per record: source, names, the cells, the first 80 characters of the
+next line, the indices of the record's 30 example rows in the pool, and the decisions as
+[kind, position, is_syntax]. Everything a question needs (the polluted text, context snippets, parse-so-far,
+column profiles) is derived at run time.
 """
 import argparse, csv, html, io, json, os, random, re, sys, urllib.request
 
@@ -92,28 +98,19 @@ def build(source, names, rows, n, rng):
             continue  # one polluted copy per record
         seen.add(i)
         record = rows[i]
-        for pollution in ["unquoted"]:
-            text, decisions = render(record)
-            nxt = render(rows[(i + 1) % len(rows)])[0]
-            decisions.append({"kind": "newline", "pos": len(text), "truth": "syntax"})  # the break to the next record
-            for d in decisions:
-                p = d["pos"]
-                full = text + "\n" + nxt
-                d["before"], d["after"] = full[max(0, p - 14):p], full[p + 1:p + 15]
-                d["after_long"] = full[p + 1:p + 81]  # look-ahead for the cell question
-                fields, cur = so_far(record, text, p)
-                d["so_far"] = "Fields read so far: %s. Current field so far: %r." % (
-                    ", ".join("%s=%r" % (nm, f) for nm, f in zip(names, fields)) or "none", cur)
-                d["fields_so_far"] = dict(zip(names, fields))
-                d["column"] = names[min(len(fields), len(names) - 1)]  # the column this cell belongs to
-                d["cell"] = cur  # the cell's text up to this point
-                d["remaining"] = full[p - len(cur):p - len(cur) + 240]  # from the start of this cell onwards
-            examples = [rows[k] for k in rng.sample(range(len(rows)), 31) if k != i][:30]  # clean records
-            items.append({"source": source, "pollution": pollution, "names": names, "record": record, "cell": j,
-                          "text": text, "examples": examples, "decisions": decisions,
-                          "before": render(rows[i - 1])[0] if i > 0 else "",
-                          "after": [render(rows[(i + k) % len(rows)])[0] for k in (1, 2)]})
-    return items
+        text, decisions = render(record)
+        nxt = render(rows[(i + 1) % len(rows)])[0]
+        decisions.append({"kind": "newline", "pos": len(text), "truth": "syntax"})  # the break to the next record
+        items.append({"source": source, "names": names, "record": record, "next": nxt[:80],
+                      "decisions": [[d["kind"][0], d["pos"], d["truth"] == "syntax"] for d in decisions]})
+    # a pool of clean rows outside the benchmark; each record gets its own 30 example rows drawn from it,
+    # from which the runner derives that record's column profiles
+    pool = [r for k, r in enumerate(rows) if k not in seen and len(r) == len(names)]
+    rng.shuffle(pool)
+    pool = pool[:400]
+    for it in items:
+        it["examples"] = rng.sample(range(len(pool)), min(30, len(pool)))
+    return items, {"source": source, "names": names, "pool": pool}
 
 
 def main():
@@ -122,16 +119,19 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
     rng = random.Random(a.seed)
-    items = []
+    items, meta = [], []
     for source, loader in [("gutenberg", gutenberg), ("nycjobs", nycjobs), ("hn", hn)]:
         names, rows = loader()
-        built = build(source, names, rows, a.per_source, rng)
+        built, m = build(source, names, rows, a.per_source, rng)
         print("%-10s %6d rows -> %4d records, %6d decisions" % (source, len(rows), len(built), sum(len(x["decisions"]) for x in built)))
         items += built
+        meta.append(m)
     with open(OUT, "w", encoding="utf-8") as f:
+        for m in meta:
+            f.write(json.dumps({"meta": m}, ensure_ascii=False) + "\n")
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
-    print("wrote", OUT)
+    print("wrote", OUT, "(%.1f MB)" % (os.path.getsize(OUT) / 1e6))
 
 
 if __name__ == "__main__":

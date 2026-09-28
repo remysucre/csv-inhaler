@@ -16,8 +16,8 @@ machine is `git add -A && git commit`.
 |---|---|
 | `bench/build.py` | builds `bench/data/decisions.jsonl` from clean public data; downloads are cached in `bench/data/raw/` (gitignored) |
 | `bench/run.py` | runs a model over the dataset in parallel, prints the report, saves per-decision results as jsonl |
-| `bench/data/decisions.jsonl` | the dataset: 866 records, 33,834 labelled decisions |
-| `bench/data/jev2_*.jsonl` | results on the current dataset (older `jev_*`, `laya*`, `winnow*` files are from the previous, one-cell pollution and are not comparable) |
+| `bench/data/decisions.jsonl` | the dataset, 6.2 MB: 860 records, 32,571 labelled decisions (compact format, see below) |
+| `bench/data/jev2_*.jsonl` | results on the current dataset, ~0.8 MB each: one probability per decision plus the run's arguments and token usage; older runs (one-cell pollution, per-record profiles, full-format files) were moved out of the repo because they were 77 MB each and not comparable |
 | `csv_inhaler.py`, `tests/`, `eval/` | the tool, its offline tests, and end-to-end evaluations of the tool on Pollock files |
 | `README.md` | describes the tool; its "Benchmark" section still describes the old one-cell pollution and needs rewriting |
 
@@ -29,8 +29,16 @@ API (paragraphs, quotes, code). `build.py` samples records that have at least on
 or line break, and writes each record as `",".join(cells)`: no quoting, no escaping. Labels come from the clean
 record. Every comma and line break is a decision; quotes are never asked about.
 
-Deterministic for a given `--seed` (default 1). `--per-source 300` was used; the runs so far use the first 100
-records per source that `run.py --limit 100` draws (also seeded), so 200 per source are untouched.
+Deterministic for a given `--seed` (default 1), but the source data itself changes over time (Hacker News is
+"newest comments", the catalog and the job postings update), so the committed file is the benchmark; rebuilding
+gives a different one. `--per-source 300` was used; the runs use the 100 per source that `run.py --limit 100`
+draws (also seeded), so 200 per source are untouched.
+
+Compact format: the file starts with one `{"meta": …}` line per source (column names and a pool of 400 clean
+rows from outside the benchmark), then one line per record with the cells, the start of the next line, the
+indices of the record's 30 example rows in the pool, and decisions as `[kind, position, is_syntax]`. The
+runner derives the polluted text (`",".join(cells)`), context snippets, parse-so-far and per-record column
+profiles at load time. Results files hold `p` per decision in dataset order; truth is looked up in the dataset.
 
 ```
 python3 bench/build.py --per-source 300
@@ -71,21 +79,19 @@ Records over the model's token limit are counted separately, never as errors.
   **"Attempting to parse:"**.
 - Question: the plain wording with **14 characters of context** each side, default criteria.
 
-Results on the current dataset, 100 records per source:
+Results on the committed dataset, 100 records per source (12,044 decisions), each run 15 s and about $0.08:
 
 | config | overall | separators | textual commas | line breaks | records Gut / HN / NYC |
 |---|---|---|---|---|---|
-| noul | 98.2% | 98.3% | 98.0% | 100% | 53 / 79 / 34 |
-| choice | 97.9% | 95.7% | 99.1% | 100% | 59 / 82 / 26 |
-| mean(choice, noul) | 98.2% | 97.0% | 98.7% | 100% | 59 / 83 / 32 |
+| noul (2 runs) | 98.0–98.1% | 98.3% | 97.9% | 100% | 51–54 / 84–85 / 25–28 |
+| choice | 97.9% | 95.5% | 99.1% | 100% | 55 / 89 / 22 |
 
 Ensemble is computed offline from the two saved jsonl files (same records, same order):
 ```python
 import json
-c=[json.loads(l) for l in open('bench/data/jev2_choice.jsonl')]; n=[json.loads(l) for l in open('bench/data/jev2_noul.jsonl')]
-for rc, rn in zip(c, n):
-    for dc, dn in zip(rc['decisions'], rn['decisions']):
-        p = (dc['p'] + dn['p']) / 2   # decide syntax if p >= 0.5; dc['truth'] is the label
+c=[json.loads(l) for l in open('bench/data/jev2_choice.jsonl')][1:]; n=[json.loads(l) for l in open('bench/data/jev2_noul.jsonl')][1:]
+for rc, rn in zip(c, n):                       # same records, same order; line 0 of each file is the run's metadata
+    p = [(a + b) / 2 for a, b in zip(rc['p'], rn['p'])]   # decide syntax if p >= 0.5; truth is in decisions.jsonl
 ```
 Run-to-run noise on Jev: overall accuracy stable to 0.1 points; whole-record counts wobble ±3 per source.
 
@@ -111,14 +117,18 @@ worse at spotting textual commas. Small local context wins.
 
 ## Other facts worth knowing
 
-- Laya answers the polarity of the question, not the content; winnow (on the old dataset) was ~74% and
-  inverted on quotes. A winnow run on the current dataset was started on the M5 at the time of writing
-  (`bench/data/winnow2_noul.jsonl` when done).
+- Laya answers the polarity of the question, not the content. Winnow, same config as Jev's noul on a 30-per-source
+  draw of the previous dataset version: 82.3% overall, 68.6% on textual commas (30.7% on Gutenberg's), 24 of 30
+  NYC Jobs records over its context limit, 19 minutes on the M5 versus 5 s for Jev at 98.0%. Not re-run on the
+  committed dataset; the 5070 box run should use it.
 - TypeSafe skill is installed (`claude plugin install typesafe@typesafe-ai`); its docs are at
   docs.typesafe.ai (`*.md` suffix for Markdown). Structure-recovery cookbook is the closest published pattern.
 - Ollaya on this Mac is the desktop app at 127.0.0.1:11435; the CLI is inside the app bundle.
 - Jev limits: 32k tokens for state + longest question, 64k per request; exceeding returns HTTP 400
   `max_tokens_exceeded`, which the runner counts as "too long".
+- Cost: the runner sums `usage.input_tokens` and prints it with the $0.042/M price. A 100-per-source run is
+  ~1.8M tokens ($0.08). Extrapolated to whole sources: Gutenberg catalog ~$10.6, all NYC job postings ~$1.4,
+  Hacker News ~$73 per million comments; the state (column profiles, re-sent per record) dominates.
 
 ## To do
 

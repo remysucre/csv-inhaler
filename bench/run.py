@@ -10,7 +10,46 @@ import argparse, collections, json, os, random, sys, time, urllib.error, urllib.
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from csv_inhaler import question  # noqa: E402
+from build import so_far as parse_so_far  # noqa: E402
+
+
+def load_dataset(path):
+    """Read the compact file; expand each record into the fields the question builders use."""
+    meta, items = {}, []
+    for line in open(path, encoding="utf-8"):
+        obj = json.loads(line)
+        if "meta" in obj:
+            meta[obj["meta"]["source"]] = obj["meta"]
+            continue
+        m = meta[obj["source"]]
+        text = ",".join(obj["record"])
+        full = text + "\n" + obj["next"]
+        names = obj["names"]
+        decisions = []
+        for kind, p, is_syntax in obj["decisions"]:
+            d = {"kind": {"d": "delimiter", "n": "newline", "q": "quote"}[kind], "pos": p, "truth": "syntax" if is_syntax else "text",
+                 "before": full[max(0, p - 14):p], "after": full[p + 1:p + 15], "after_long": full[p + 1:p + 81]}
+            fields, cur = parse_so_far(obj["record"], text, p)
+            d["so_far"] = "Fields read so far: %s. Current field so far: %r." % (
+                ", ".join("%s=%r" % (nm, f) for nm, f in zip(names, fields)) or "none", cur)
+            d["fields_so_far"] = dict(zip(names, fields))
+            d["column"] = names[min(len(fields), len(names) - 1)]
+            d["cell"] = cur
+            d["remaining"] = full[p - len(cur):p - len(cur) + 240]
+            decisions.append(d)
+        examples = [m["pool"][k] for k in obj["examples"]]
+        profiles = []
+        for c in range(len(names)):
+            values = []
+            for e in examples:
+                if e[c] and e[c] not in values:
+                    values.append(e[c])
+            profiles.append([v[:80] for v in values])
+        items.append({"source": obj["source"], "pollution": "unquoted", "names": names, "record": obj["record"], "text": text,
+                      "examples": examples, "profiles": profiles, "before": "", "after": [obj["next"]], "decisions": decisions})
+    return items
 
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "decisions.jsonl")
 
@@ -23,12 +62,8 @@ def state_of(item, cell_question=False, examples=2, neighbors=False, profiles=0,
     """State text. `texts` (list) batches several malformed records into one state, numbered from 1."""
     s = "CSV file with %d columns: %s. Delimiter ',', quote \".\n" % (len(item["names"]), ", ".join(item["names"]))
     if profiles:
-        for c, name in enumerate(item["names"]):
-            values = []
-            for e in item["examples"]:
-                if e[c] and e[c] not in values:
-                    values.append(e[c])
-            s += "Sample values of column %s: %s\n" % (name, "; ".join(repr(v[:80]) for v in values[:profiles]))
+        for name, values in zip(item["names"], item["profiles"]):
+            s += "Sample values of column %s: %s\n" % (name, "; ".join(repr(v) for v in values[:profiles]))
     for e in item["examples"][:examples]:
         if cell_question:
             s += "Valid parse of a row from the same file: %s\n" % pairs(item["names"], e)
@@ -82,7 +117,13 @@ def ask(host, model, state, questions, timeout, choice=False):
         for qid, *_ in batch:
             a = resp["answers"][qid]
             answers[qid] = a["probabilities"]["yes"] if choice else a["noul"]
+        USAGE["input_tokens"] += resp.get("usage", {}).get("input_tokens", 0)
+        USAGE["requests"] += 1
     return answers
+
+
+USAGE = {"input_tokens": 0, "requests": 0}
+JEV_PRICE_PER_MILLION = 0.042  # USD, input tokens; output is free
 
 
 def json_state(item, a_examples=2):
@@ -225,7 +266,9 @@ def report(results, model, seconds):
         for d in r["decisions"]:
             for key in ((r["source"], d["kind"], d["truth"]), ("ALL", d["kind"], d["truth"]), ("ALL", d["kind"], "both"), ("ALL", "all", "both")):
                 acc[key][0] += d["correct"]; acc[key][1] += 1
-    print("\n%s  (%.0f s)" % (model, seconds))
+    print("\n%s  (%.0f s, %d requests, %s input tokens%s)" % (
+        model, seconds, USAGE["requests"], format(USAGE["input_tokens"], ","),
+        ", $%.4f at Jev prices" % (USAGE["input_tokens"] / 1e6 * JEV_PRICE_PER_MILLION) if "jev" in model else ""))
     print("%-10s %-9s %-7s %8s %7s" % ("source", "decision", "truth", "n", "acc"))
     for key in sorted(acc, key=lambda k: (k[0] != "ALL", k)):
         right, n = acc[key]
@@ -243,6 +286,7 @@ def main():
                     help="Ollaya server, or https://api.typesafe.ai with TYPESAFE_API_KEY set and --model jev-latest")
     ap.add_argument("--limit", type=int, default=None, help="records per source")
     ap.add_argument("--pollution", choices=["unquoted", "unescaped"], default=None)
+    ap.add_argument("--source", default=None, help="only this source (gutenberg, nycjobs, hn)")
     ap.add_argument("--so-far", action="store_true", help="append the teacher-forced parse-so-far to each question")
     ap.add_argument("--examples", type=int, default=2, help="clean rows of the same file shown in the state (up to 30)")
     ap.add_argument("--context", type=int, default=14, help="characters of context on each side of the questioned character")
@@ -268,9 +312,11 @@ def main():
     if "://" not in a.host:
         a.host = "http://" + a.host
 
-    items = [json.loads(l) for l in open(DATA, encoding="utf-8")]
+    items = load_dataset(DATA)
     if a.pollution:
         items = [it for it in items if it["pollution"] == a.pollution]
+    if a.source:
+        items = [it for it in items if it["source"] == a.source]
     if a.limit:
         rng, picked = random.Random(a.seed), []
         for src in sorted({it["source"] for it in items}):
@@ -298,10 +344,12 @@ def main():
     else:
         with ThreadPoolExecutor(a.workers) as pool:
             results = list(pool.map(work, items))
-    if a.out:
+    if a.out:  # compact: one probability per decision, in dataset order; labels live in the dataset
         with open(a.out, "w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"args": vars(a), "usage": USAGE}) + "\n")
+            for it, r in zip(items, results):
+                f.write(json.dumps({"source": r["source"], "text": it["text"], "too_long": r["too_long"],
+                                    "p": [round(d["p"], 4) for d in r["decisions"]]}) + "\n")
     report(results, a.model + (" +so-far" if a.so_far else "") + (" +cell-question" if a.cell_question else "") + (" +choice" if a.choice else "") + (" +json" if a.json else "") + (" +quotes" if a.quotes else "") + " examples=%d" % a.examples + (" +neighbors" if a.neighbors else "")
            + (" profiles=%d" % a.profiles if a.profiles else "") + (" rows/request=%d" % a.rows_per_request if a.rows_per_request > 1 else "")
            + " context=%d" % a.context + (" +marker" if a.marker else "") + (" +ordinal" if a.ordinal else "")
