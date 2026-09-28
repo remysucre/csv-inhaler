@@ -1,10 +1,9 @@
 # csv-inhaler
 
-Clean a dirty CSV file with a local decision model. One file, standard library only, streams stdin to
-stdout.
+Clean a dirty CSV file with a local decision model. 
 
-Requires a running [Ollaya](https://ollaya.dev) server with a model pulled: `curl -fsSL https://ollaya.dev/install.sh | sh`,
-then `ollaya pull laya:en`. If it is not on `127.0.0.1:11435`, set `OLLAYA_HOST` or pass `--host`.
+Requires a running [Ollaya](https://ollaya.dev/docs/quickstart) server with a model pulled.
+If it is not on `127.0.0.1:11435`, set `OLLAYA_HOST` or pass `--host`.
 
 ```sh
 csv-inhaler dirty.csv > clean.csv
@@ -23,15 +22,6 @@ parse, an [Ollaya](https://ollaya.dev) decision model is asked one yes/no questi
    opening or closing a quoted value, rather than a literal character of the text?" A quote judged syntax
    toggles the quoted state; inside quotes, delimiters are text without asking. Each question carries the
    fields read so far and the current field so far, so later decisions see earlier ones.
-
-The model is trusted: there is no field-count constraint and no assumption that `""` is an escape. If its
-reading of a line does not have the right number of fields, that line is reported on stderr and skipped,
-and the rest of the file is still cleaned; the exit status is 1 when anything was skipped, and `--log` has
-every decision behind it.
-
-The state (context) sent with every question is the schema, the delimiter and quote, a few clean rows from the same
-file as examples, the malformed text, and the parse so far. `--log` records every decision with its
-probability as one JSON line per repaired record.
 
 ## Options
 
