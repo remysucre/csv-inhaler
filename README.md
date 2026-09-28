@@ -1,102 +1,47 @@
-# Quack
+# csv-inhaler
 
-This repository is based on https://github.com/duckdb/extension-template, check it out if you want to build and ship your own DuckDB extension.
+Clean a dirty CSV file with a local decision model. One file, standard library only, streams stdin to
+stdout.
 
----
+Requires a running [Ollaya](https://ollaya.dev) server with a model pulled: `curl -fsSL https://ollaya.dev/install.sh | sh`,
+then `ollaya pull laya:en`. If it is not on `127.0.0.1:11435`, set `OLLAYA_HOST` or pass `--host`.
 
-This extension, Quack, allow you to ... <extension_goal>.
-
-
-## Building
-### Managing dependencies
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-git clone https://github.com/Microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-Note: VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step. Note that the example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
-
-### Build steps
-Now to build the extension, run:
 ```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/quack/quack.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `quack.duckdb_extension` is the loadable binary as it would be distributed.
-
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`.
-
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `quack()` that takes a string arguments and returns a string:
-```
-D select quack('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Quack Jane 🐥 │
-└───────────────┘
+csv-inhaler dirty.csv > clean.csv
+cat dirty.csv | csv-inhaler --model winnow:e4b --log decisions.jsonl > clean.csv
 ```
 
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
-```sh
-make test
-```
+Each line is parsed with Python's `csv` module in strict mode. Lines that parse with the right number of
+fields are written out unchanged. When a line does not
+parse, an [Ollaya](https://ollaya.dev) decision model is asked one yes/no question at a time:
 
-### Installing the deployed binaries
-To install your extension binaries from S3, you will need to do two things. Firstly, DuckDB should be launched with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. Some examples:
+1. **Does the next line belong to this record?** For each following line: "Is the line break between
+   `…` and `…` the end of a record, rather than a line break inside a text value?" Lines are joined while
+   the model says the break is inside a value (up to `--max-lines`).
+2. **Character by character:** every delimiter outside quotes gets "Is the ',' between `…` and `…` a
+   separator between two fields?", and every quote gets "Is the quote between `…` and `…` CSV syntax,
+   opening or closing a quoted value, rather than a literal character of the text?" A quote judged syntax
+   toggles the quoted state; inside quotes, delimiters are text without asking. Each question carries the
+   fields read so far and the current field so far, so later decisions see earlier ones.
 
-CLI:
-```shell
-duckdb -unsigned
-```
+The model is trusted: there is no field-count constraint and no assumption that `""` is an escape. If its
+reading of a line does not have the right number of fields, that line is reported on stderr and skipped,
+and the rest of the file is still cleaned; the exit status is 1 when anything was skipped, and `--log` has
+every decision behind it.
 
-Python:
-```python
-con = duckdb.connect(':memory:', config={'allow_unsigned_extensions' : 'true'})
-```
+The state (context) sent with every question is the schema, the delimiter and quote, a few clean rows from the same
+file as examples, the malformed text, and the parse so far. `--log` records every decision with its
+probability as one JSON line per repaired record.
 
-NodeJS:
-```js
-db = new duckdb.Database(':memory:', {"allow_unsigned_extensions": "true"});
-```
+## Options
 
-Secondly, you will need to set the repository endpoint in DuckDB to the HTTP url of your bucket + version of the extension
-you want to install. To do this run the following SQL query in DuckDB:
-```sql
-SET custom_extension_repository='bucket.s3.eu-west-1.amazonaws.com/<your_extension_name>/latest';
-```
-Note that the `/latest` path will allow you to install the latest extension version available for your current version of
-DuckDB. To specify a specific version, you can pass the version instead.
-
-After running these steps, you can install and load your extension using the regular INSTALL/LOAD commands in DuckDB:
-```sql
-INSTALL quack;
-LOAD quack;
-```
-
-## Setting up CLion
-
-### Opening project
-Configuring CLion with this extension requires a little work. Firstly, make sure that the DuckDB submodule is available.
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
-
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
-
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
-
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
+| option | default | meaning |
+|---|---|---|
+| `input` | stdin | file or `-` |
+| `--model` | `laya:en` | Ollaya model; `winnow:e4b` decides much better, `laya:en` answers in milliseconds |
+| `--host` | `$OLLAYA_HOST` or `http://127.0.0.1:11435` | Ollaya server; `$OLLAYA_API_KEY` is sent if set |
+| `-d`, `-q` | sniffed, `"` | delimiter (most frequent of `,` `;` tab `|` in the header) and quote |
+| `--names a,b,c` | | column names for a file without a header |
+| `--examples` | 3 | clean rows shown to the model |
+| `--max-lines` | 50 | most physical lines joined into one record |
+| `--log FILE` | | JSON line per repaired record: text, fields, every decision with its probability |

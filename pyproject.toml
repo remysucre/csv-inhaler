@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csv-inhaler"
+version = "0.1.0"
+description = "Clean a dirty CSV file as a stream, asking a local decision model (Ollaya) about ambiguous delimiters, quotes and line breaks"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+csv-inhaler = "csv_inhaler:main"
+
+[tool.setuptools]
+py-modules = ["csv_inhaler"]

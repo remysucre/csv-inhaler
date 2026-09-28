@@ -1,0 +1,10 @@
+id,name,note,amount
+1,"alice","plain",10
+2,"bob","quoted, comma",20
+3,"carol","say ""hi""",30
+4,dave,5" pipe,40
+5,"erin"jr,garbage after quote,50
+6,frank,says ""hi"",60
+7,"grace","fine",70
+8,"heidi","a ""quoted"" note, with comma",80
+9,"ivan","ok",90

@@ -1,0 +1,19 @@
+id,name,note,amount
+1,alice,plain,10
+2,bob,unquoted, comma in note,20
+3,"carol, jr",quoted comma,30
+4,dave,too,many,fields,40
+5,erin,50
+6,frank
+7,grace,5" pipe,70
+8,heidi,says ""hi"",80
+9,"ivan"jr,garbage after quote,90
+10,judy,"say ""hi""",100
+11,kim,trailing comma,110,
+12,liam,"a ""quoted"" note, with comma",120
+13,mia;semicolon;line;130
+14,noah,line one
+line two,140
+15,olivia,"unterminated,150
+16,pat,fine,160
+-- end of export --
