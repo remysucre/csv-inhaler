@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""csv-inhaler: clean a dirty CSV file with a local decision model.
+"""csv-inhaler: clean a dirty CSV file with a decision model.
 
 Each line is parsed with Python's csv module in strict mode and, if it parses,
-written out as is.
-Otherwise the model (Ollaya, https://ollaya.dev) is asked, one yes/no question
-at a time: first whether the following lines belong to the same record, then,
-walking the text character by character, whether each delimiter and quote is
-CSV syntax or data.
+written out as is. Otherwise a decision model (Ollaya, https://ollaya.dev, or
+TypeSafe's Jev) is asked yes/no questions: whether each following line break
+ends the record, then, in one batched request, whether each comma in the record
+separates two fields. Quotes are never asked about: a field that starts and
+ends with a quote is unquoted. Only framing is repaired; values are never
+changed. A line whose reading does not have the right number of fields is
+reported and skipped.
 """
-import argparse, csv, json, os, sys, urllib.request
+import argparse, csv, json, os, sys, time, urllib.error, urllib.request
 
 DEFAULT_HOST = "http://127.0.0.1:11435"
 
@@ -21,31 +23,53 @@ def parse(text, delim, quote):
         return None
 
 
+def question(kind, char, before, after):
+    """(instructions, yes, no) for one decision, with the text around it as context."""
+    ctx = "between %r and %r" % (before, after)
+    if kind == "delimiter":
+        return ("Is the %r %s a separator between two fields?" % (char, ctx),
+                "a field separator", "part of the text of one value")
+    return ("Is the line break %s the end of a record, rather than a line break inside a text value?" % ctx,
+            "the end of a record: the next line is a new record", "a line break inside a value: one record")
+
+
 class Model:
-    """One yes/no (`noul`) question per request to Ollaya's /v1/decisions endpoint."""
+    """Batched `noul` questions to a TypeSafe-compatible /v1/systemone endpoint (Ollaya or api.typesafe.ai)."""
 
     def __init__(self, host, name, timeout=120):
         host = host or os.environ.get("OLLAYA_HOST") or DEFAULT_HOST
         self.host = (host if "://" in host else "http://" + host).rstrip("/")
         self.name, self.timeout, self.requests = name, timeout, 0
 
-    def decide(self, state, question, yes, no):
-        body = {"model": self.name, "state": state,
-                "questions": {"q": {"type": "noul", "instructions": question, "criteria": {"true": yes, "false": no}}}}
+    def ask(self, state, questions):
+        """questions: {id: (instructions, yes, no)} -> {id: P(yes)}."""
+        body = {"model": self.name, "state": state, "questions": {
+            qid: {"type": "noul", "instructions": q, "criteria": {"true": yes, "false": no}}
+            for qid, (q, yes, no) in questions.items()}}
         headers = {"Content-Type": "application/json"}
-        if os.environ.get("OLLAYA_API_KEY"):
-            headers["Authorization"] = "Bearer " + os.environ["OLLAYA_API_KEY"]
-        req = urllib.request.Request(self.host + "/v1/decisions", json.dumps(body).encode(), headers)
+        key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("OLLAYA_API_KEY")
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        req = urllib.request.Request(self.host + "/v1/systemone", json.dumps(body).encode(), headers)
         self.requests += 1
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.load(r)["answers"]["q"]["noul"]
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    answers = json.load(r)["answers"]
+                return {qid: answers[qid]["noul"] for qid in questions}
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 529) and attempt < 5:
+                    time.sleep(2 ** attempt); continue
+                raise SystemExit("csv-inhaler: %s answered HTTP %d: %s" % (self.host, e.code, e.read().decode(errors="replace")[:500]))
+            except urllib.error.URLError as e:
+                raise SystemExit("csv-inhaler: cannot reach %s (%s)" % (self.host, e.reason))
 
 
 class Inhaler:
     def __init__(self, model, names, delim=",", quote='"', examples=3, max_lines=50, log=None):
         self.model, self.names, self.delim, self.quote = model, names, delim, quote
         self.examples, self.want_examples, self.max_lines, self.log = [], examples, max_lines, log
-        self.decisions, self.skipped = [], 0
+        self.skipped = 0
 
     def run(self, lines):
         """lines: iterator of physical lines without the newline. Yields records in file order."""
@@ -59,58 +83,49 @@ class Inhaler:
                 line = next(lines, None)
                 continue
             # a broken record: pull in following lines while the model says the line break is inside a value
-            self.decisions, text = [], line
+            decisions, text = [], line
             line = next(lines, None)
-            while line is not None and text.count("\n") < self.max_lines and not self.ask(
-                    text + "\n" + line, len(text), "newline",
-                    "Is the line break between %r and %r the end of a record, rather than a line break "
-                    "inside a text value?" % (text[-30:], line[:30]),
-                    "the end of a record: the next line is a new record", "a line break inside a value: one record"):
+            while line is not None and text.count("\n") < self.max_lines:
+                p = self.model.ask(self.state(text + "\n" + line),
+                                   {"n": question("newline", "\n", text[-14:], line[:14])})["n"]
+                decisions.append({"kind": "newline", "position": len(text), "probability": p, "syntax": p >= 0.5})
+                if p >= 0.5:
+                    break
                 text, line = text + "\n" + line, next(lines, None)
-            record = self.decode(text)
+            record = self.decode(text, decisions)
             if record is not None:
                 yield record
 
-    def ask(self, text, pos, kind, question, yes, no, fields=None, cur=""):
-        state = "CSV file with %d columns: %s. Delimiter %r, quote %s.\n" % (
+    def state(self, text):
+        s = "CSV file with %d columns: %s. Delimiter %r, quote %s.\n" % (
             len(self.names), ", ".join(self.names), self.delim, self.quote)
-        state += "".join("Valid row from the same file: %r\n" % e for e in self.examples)
-        state += "Malformed text: %r\n" % text
-        if fields is not None:
-            state += "Fields read so far: %s\nCurrent field so far: %r\n" % (
-                ", ".join("%s=%r" % nf for nf in zip(self.names, fields)), cur)
-        p = self.model.decide(state, question, yes, no)
-        self.decisions.append({"kind": kind, "position": pos, "probability": p, "syntax": p >= 0.5})
-        return p >= 0.5
+        s += "".join("Valid row from the same file: %r\n" % e for e in self.examples)
+        return s + "Malformed text: %r\n" % text
 
-    def decode(self, text):
-        """Walk `text` character by character; every delimiter outside quotes and every quote is a question."""
+    def decode(self, text, decisions):
+        """Ask about every delimiter in one request, split accordingly, unquote fields that are quoted."""
         d, q = self.delim, self.quote
-        fields, cur, in_quotes, i = [], "", False, 0
+        positions = [i for i in range(len(text)) if text.startswith(d, i)]
+        answers = self.model.ask(self.state(text), {
+            "d%d" % k: question("delimiter", d, text[max(0, i - 14):i], text[i + len(d):i + len(d) + 14])
+            for k, i in enumerate(positions)}) if positions else {}
+        separators = set()
+        for k, i in enumerate(positions):
+            p = answers["d%d" % k]
+            decisions.append({"kind": "delimiter", "position": i, "probability": p, "syntax": p >= 0.5})
+            if p >= 0.5:
+                separators.add(i)
+        fields, cur, i = [], "", 0
         while i < len(text):
-            ctx = "between %r and %r" % (text[max(0, i - 14):i], text[i + 1:i + 15])
-            if text.startswith(d, i) and not in_quotes:
-                if self.ask(text, i, "delimiter", "Is the %r %s a separator between two fields?" % (d, ctx),
-                            "a field separator", "part of the text of one value", fields, cur):
-                    fields, cur = fields + [cur], ""
-                else:
-                    cur += d
-                i += len(d)
-            elif text.startswith(q, i):
-                if self.ask(text, i, "quote", "Is the quote %s %s CSV syntax, opening or closing a quoted value, "
-                            "rather than a literal character of the text?" % (q, ctx),
-                            "CSV syntax: a quoting mark", "a literal quote character inside the text", fields, cur):
-                    in_quotes = not in_quotes
-                else:
-                    cur += q
-                i += 1
+            if i in separators:
+                fields.append(cur); cur = ""; i += len(d)
             else:
                 cur += text[i]; i += 1
         fields.append(cur)
+        fields = [f[1:-1].replace(q + q, q) if len(f) >= 2 and f[0] == f[-1] == q else f for f in fields]
         ok = len(fields) == len(self.names)
         if self.log:
-            self.log.write(json.dumps({"text": text, "fields": fields, "ok": ok, "decisions": self.decisions},
-                                      ensure_ascii=False) + "\n")
+            self.log.write(json.dumps({"text": text, "fields": fields, "ok": ok, "decisions": decisions}, ensure_ascii=False) + "\n")
         if not ok:
             self.skipped += 1
             sys.stderr.write("csv-inhaler: skipped %r: the model read %d fields instead of %d: %r\n" % (
@@ -122,8 +137,9 @@ class Inhaler:
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="csv-inhaler", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", nargs="?", default="-", help="CSV file, or - for stdin (default)")
-    ap.add_argument("--model", default="laya:en", help="Ollaya model (default %(default)s; winnow:e4b decides better)")
-    ap.add_argument("--host", default=None, help="Ollaya server (default $OLLAYA_HOST or %s)" % DEFAULT_HOST)
+    ap.add_argument("--model", default="laya:en", help="model name (default %(default)s; jev-latest on TypeSafe)")
+    ap.add_argument("--host", default=None, help="Ollaya server (default $OLLAYA_HOST or %s), or https://api.typesafe.ai "
+                    "with TYPESAFE_API_KEY set" % DEFAULT_HOST)
     ap.add_argument("--timeout", type=float, default=120)
     ap.add_argument("-d", "--delimiter", default=None, help="default: the most frequent of , ; tab | in the header")
     ap.add_argument("-q", "--quote", default='"')

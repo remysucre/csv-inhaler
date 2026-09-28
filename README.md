@@ -35,3 +35,22 @@ parse, an [Ollaya](https://ollaya.dev) decision model is asked one yes/no questi
 | `--examples` | 3 | clean rows shown to the model |
 | `--max-lines` | 50 | most physical lines joined into one record |
 | `--log FILE` | | JSON line per repaired record: text, fields, every decision with its probability |
+
+## Benchmark
+
+The same questions make a benchmark for decision models, and there every decision is independent: the
+ground truth supplies the parse so far, so a record's questions go out in one batched request and records
+run in parallel. Nothing is decoded.
+
+```sh
+python3 bench/build.py --per-source 300         # downloads clean data, writes bench/data/decisions.jsonl
+python3 bench/run.py --model winnow:e4b --limit 100 --workers 4 --out bench/data/winnow.jsonl
+```
+
+`build.py` takes clean public data with cells that naturally contain commas, quotes and line breaks
+(Project Gutenberg catalog, NYC job postings, Hacker News comments), removes the quoting from one such
+cell per record ("unquoted"), or keeps the quotes but stops doubling the inner ones ("unescaped"), and
+labels every delimiter, quote and line break in the result as syntax or text. `run.py` asks the model each
+question with the shared wording from `csv_inhaler.question`, optionally with the teacher-forced parse so
+far (`--so-far`), and reports accuracy per source, decision type and truth class, plus the share of records
+with every decision right. Records that exceed the model's context are counted separately.
